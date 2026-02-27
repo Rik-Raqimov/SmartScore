@@ -23,5 +23,4 @@ public class AnalysisResultDto {
 
     private Integer periodMonths;
 
-    private Date calculatedAt;
 }

@@ -2,6 +2,7 @@ package az.edu.itbrains.SmartScore.services.impls;
 
 import az.edu.itbrains.SmartScore.dtos.transaction.TransactionDto;
 import az.edu.itbrains.SmartScore.enums.CategoryType;
+import az.edu.itbrains.SmartScore.models.Transaction;
 import az.edu.itbrains.SmartScore.services.GptService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
@@ -68,21 +69,60 @@ public class GptServiceImpl implements GptService {
 
         for (String part : chunks) {
             try {
+                System.out.println("LOG: Отправляю запрос в OpenAI..."); // Проверка начала
+
                 String raw = chatClient.prompt()
                         .system(dynamicPrompt)
                         .user(part)
                         .call()
                         .content();
 
+                System.out.println("LOG AI RESPONSE: " + raw); // Проверка ответа
+
                 List<TransactionDto> res = safeParse(extractJsonArray(raw));
                 if (res != null) allRaw.addAll(res);
             } catch (Exception e) {
-                System.err.println("AI Error: " + e.getMessage());
+                System.err.println("!!! КРИТИЧЕСКАЯ ОШИБКА ИИ !!!");
+                e.printStackTrace();
             }
         }
 
         allRaw = cleanUpAIErrors(allRaw);
         return dedupe(allRaw);
+    }
+
+    @Override
+    public List<Transaction> analyzeStatementAndGetTransactions(String rawText) {
+        // 1. Вызываем уже готовый метод анализа, который возвращает DTO
+        List<TransactionDto> dtos = analyzeStatement(rawText);
+
+        if (dtos == null || dtos.isEmpty()) {
+            return List.of();
+        }
+
+        // 2. Превращаем DTO в Entity (Transaction) для сохранения в БД
+        List<Transaction> transactions = new ArrayList<>();
+
+        for (TransactionDto dto : dtos) {
+            Transaction tx = new Transaction();
+            tx.setAmount(dto.getAmount());
+            tx.setDescription(dto.getDescription());
+            tx.setCategory(dto.getCategory());
+
+            // Превращаем строку даты "yyyy-MM-ddTHH:mm:ss" в Date
+            if (dto.getOperationDate() != null) {
+                try {
+                    java.time.LocalDateTime ldt = java.time.LocalDateTime.parse(dto.getOperationDate());
+                    java.util.Date date = java.util.Date.from(ldt.atZone(java.time.ZoneId.systemDefault()).toInstant());
+                    tx.setOperationDate(date);
+                } catch (Exception e) {
+                    System.err.println("Дата парсинг xətası: " + e.getMessage());
+                }
+            }
+            transactions.add(tx);
+        }
+
+        return transactions;
     }
 
     private List<TransactionDto> cleanUpAIErrors(List<TransactionDto> list) {

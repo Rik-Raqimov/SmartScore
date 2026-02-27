@@ -10,14 +10,19 @@ import az.edu.itbrains.SmartScore.repositories.AnalysisResultRepository;
 import az.edu.itbrains.SmartScore.repositories.StatementFileRepository;
 import az.edu.itbrains.SmartScore.repositories.TransactionRepository;
 import az.edu.itbrains.SmartScore.services.AnalysisResultService;
+import az.edu.itbrains.SmartScore.services.GptService;
 import az.edu.itbrains.SmartScore.services.PdfService;
+import az.edu.itbrains.SmartScore.services.UserService;
 import lombok.RequiredArgsConstructor;
+import org.modelmapper.ModelMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.YearMonth;
 import java.time.ZoneId;
 import java.util.*;
@@ -28,10 +33,13 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class AnalysisResultServiceImpl implements AnalysisResultService {
 
+    private final ModelMapper modelMapper;
     private final TransactionRepository transactionRepository;
     private final StatementFileRepository statementFileRepository;
     private final AnalysisResultRepository analysisResultRepository;
     private final PdfService pdfService;
+    private final GptService gptService;
+    private final UserService userService;
 
     private static final Set<CategoryType> EXPENSE_CATS = Set.of(
             CategoryType.DAILY, CategoryType.ESSENTIAL, CategoryType.CREDIT
@@ -118,6 +126,62 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
         dto.setScore(finalScore);
         dto.setPeriodMonths(months.size());
         return dto;
+    }
+
+    @Override
+    @Transactional
+    public AnalysisResultDto processAndAnalyze(MultipartFile file) {
+        try {
+            String fileName = UUID.randomUUID() + "_" + file.getOriginalFilename();
+            java.io.File uploadDir = new java.io.File("uploads");
+            if (!uploadDir.exists()) uploadDir.mkdirs();
+
+            // Объявляем destination
+            java.io.File destination = new java.io.File(uploadDir.getAbsolutePath() + java.io.File.separator + fileName);
+            file.transferTo(destination);
+
+            User currentUser = userService.getCurrentUser();
+            StatementFile statementFile = new StatementFile();
+            statementFile.setOriginalFileName(fileName);
+            statementFile.setStoredFilePath(destination.getAbsolutePath());
+            statementFile.setFileType("application/pdf");
+            statementFile.setStatus(az.edu.itbrains.SmartScore.enums.StatementFileStatus.COMPLETED);
+            statementFile.setUser(currentUser);
+            statementFile.setUploadedAt(LocalDateTime.now());
+
+            statementFile = statementFileRepository.save(statementFile);
+
+            // --- ТЕПЕРЬ ВСЁ БУДЕТ ВИДНО ---
+
+            // 1. Извлекаем текст
+            String rawText = pdfService.extractText(destination.getAbsolutePath());
+
+            // 2. Отправляем в ИИ (теперь gptService виден!)
+            List<Transaction> transactions = gptService.analyzeStatementAndGetTransactions(rawText);
+
+            // 3. Сохраняем транзакции
+            for (Transaction tx : transactions) {
+                tx.setStatementFile(statementFile);
+                tx.setUser(currentUser);
+            }
+            transactionRepository.saveAll(transactions);
+            transactionRepository.flush();
+
+            return calculateScore(currentUser);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            throw new RuntimeException("Xəta: " + e.getMessage());
+        }
+    }
+
+
+    @Override
+    public AnalysisResultDto getLatestResultForUser() {
+        User currentUser = userService.getCurrentUser();
+        return analysisResultRepository.findTopByUserIdOrderByCalculatedAtDesc(currentUser.getId())
+                .map(entity -> modelMapper.map(entity, AnalysisResultDto.class))
+                .orElse(new AnalysisResultDto());
     }
 
     // ✅ БРОНЕБОЙНЫЙ ХРОНОЛОГИЧЕСКИЙ СКАНЕР PDF
@@ -223,18 +287,32 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
     }
 
     private int calcBalanceDynamicsFromPdf(BigDecimal start, BigDecimal end) {
-        if (start.compareTo(BigDecimal.ZERO) <= 0) return 50;
-
-        if (end.compareTo(BigDecimal.ONE) < 0) {
-            System.out.println("LOG: --- 3. БАЛАНС -> Слит в ноль (" + end + "). БАЛЛ=0 ---");
+        // Если в конце периода на счету 0 или меньше — это 0 баллов, без вариантов.
+        if (end.compareTo(BigDecimal.ZERO) <= 0) {
+            System.out.println("LOG: --- 3. БАЛАНС -> Слит в ноль или минус. БАЛЛ=0 ---");
             return 0;
         }
 
-        BigDecimal trend = end.subtract(start).divide(start, CALC_SCALE, RoundingMode.HALF_UP);
-        BigDecimal score = BigDecimal.valueOf(50).add(trend.multiply(BigDecimal.valueOf(50)));
-        return clampInt(score.setScale(0, RoundingMode.HALF_UP).intValue(), 0, 100);
-    }
+        // Если в начале был 0, а в конце появились деньги — это хороший знак (рост с нуля).
+        // Даем 70 баллов за накопление, но не 100, так как нет истории.
+        if (start.compareTo(BigDecimal.ZERO) <= 0) {
+            return 70;
+        }
 
+        // Считаем процент изменения: (Конец - Начало) / Начало
+        BigDecimal growthRate = end.subtract(start).divide(start, CALC_SCALE, RoundingMode.HALF_UP);
+
+        // Базовая оценка — 60 баллов (если баланс не изменился).
+        // Добавляем или отнимаем баллы в зависимости от роста/падения.
+        BigDecimal score = BigDecimal.valueOf(60).add(growthRate.multiply(BigDecimal.valueOf(40)));
+
+        int finalScore = clampInt(score.setScale(0, RoundingMode.HALF_UP).intValue(), 0, 100);
+
+        System.out.println("LOG: --- 3. БАЛАНС ---");
+        System.out.println("LOG: Старт: " + start + ", Конец: " + end + " | Динамика: " + finalScore);
+
+        return finalScore;
+    }
     private int calcPaymentHistory(Map<YearMonth, MonthAgg> monthMap, List<YearMonth> months) {
         int n = months.size();
         if (n == 0) return 0;
