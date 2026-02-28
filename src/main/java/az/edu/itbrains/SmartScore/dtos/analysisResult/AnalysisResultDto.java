@@ -13,13 +13,13 @@ public class AnalysisResultDto {
 
     private Integer score;
 
-    private Integer incomeStability; // Gəlir Stabilliyi
+    private Integer incomeStability;
 
-    private Integer expenseControl;    // Xərc İdarəsi
+    private Integer expenseControl;
 
-    private Integer balanceDynamics;   // Balans Dinamikası
+    private Integer balanceDynamics;
 
-    private Integer paymentHistory;    // Ödəniş Tarixçəsi
+    private Integer paymentHistory;
 
     private Integer periodMonths;
 

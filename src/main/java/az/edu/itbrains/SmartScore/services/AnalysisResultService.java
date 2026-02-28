@@ -1,6 +1,7 @@
 package az.edu.itbrains.SmartScore.services;
 
 import az.edu.itbrains.SmartScore.dtos.analysisResult.AnalysisResultDto;
+import az.edu.itbrains.SmartScore.dtos.user.UserProfileDto;
 import az.edu.itbrains.SmartScore.models.User;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -10,4 +11,6 @@ public interface AnalysisResultService {
     AnalysisResultDto processAndAnalyze(MultipartFile file);
 
     AnalysisResultDto getLatestResultForUser();
+
+    UserProfileDto getUserProfileData();
 }

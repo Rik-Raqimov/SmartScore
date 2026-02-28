@@ -4,8 +4,7 @@ import az.edu.itbrains.SmartScore.models.User;
 import az.edu.itbrains.SmartScore.repositories.UserRepository;
 import az.edu.itbrains.SmartScore.services.UserService;
 import lombok.RequiredArgsConstructor;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.security.core.userdetails.UsernameNotFoundException;
+//import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -31,11 +30,17 @@ public class UserServiceImpl implements UserService {
 
     @Override
     public User getCurrentUser() {
-        String email = SecurityContextHolder.getContext().getAuthentication().getName();
-        User user = userRepository.findByEmail(email);
+        String email = "test@mail.com";
 
+        User user = userRepository.findByEmail(email);
         if (user == null) {
-            return null;
+            user = new User();
+            user.setEmail(email);
+            user.setFullName("Test User");
+
+            user.setPassword("password_stub");
+
+            user = userRepository.save(user);
         }
         return user;
     }

@@ -1,6 +1,8 @@
 package az.edu.itbrains.SmartScore.services.impls;
 
+import az.edu.itbrains.SmartScore.dtos.analysisResult.AnalysisHistoryItemDto;
 import az.edu.itbrains.SmartScore.dtos.analysisResult.AnalysisResultDto;
+import az.edu.itbrains.SmartScore.dtos.user.UserProfileDto;
 import az.edu.itbrains.SmartScore.enums.CategoryType;
 import az.edu.itbrains.SmartScore.models.AnalysisResult;
 import az.edu.itbrains.SmartScore.models.StatementFile;
@@ -9,6 +11,7 @@ import az.edu.itbrains.SmartScore.models.User;
 import az.edu.itbrains.SmartScore.repositories.AnalysisResultRepository;
 import az.edu.itbrains.SmartScore.repositories.StatementFileRepository;
 import az.edu.itbrains.SmartScore.repositories.TransactionRepository;
+import az.edu.itbrains.SmartScore.repositories.UserRepository;
 import az.edu.itbrains.SmartScore.services.AnalysisResultService;
 import az.edu.itbrains.SmartScore.services.GptService;
 import az.edu.itbrains.SmartScore.services.PdfService;
@@ -21,6 +24,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.text.SimpleDateFormat;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.YearMonth;
@@ -184,7 +188,55 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
                 .orElse(new AnalysisResultDto());
     }
 
-    // ✅ БРОНЕБОЙНЫЙ ХРОНОЛОГИЧЕСКИЙ СКАНЕР PDF
+    @Override
+    public UserProfileDto getUserProfileData() {
+        User user = userService.getCurrentUser();
+        if (user == null) {
+            throw new RuntimeException("İstifadəçi tapılmadı");
+        }
+
+        List<AnalysisResult> results = user.getAnalysisResults();
+
+        UserProfileDto profileDto = new UserProfileDto();
+        profileDto.setTotalAnalyses(results.size()); // "Cəmi analiz"
+
+        if (!results.isEmpty()){
+            AnalysisResult latest = results.get(0);
+            profileDto.setLastResult(latest.getScore() + "%");
+            profileDto.setLastAnalysisDate(formatDate(latest.getCalculatedAt()));
+        }
+
+        List<AnalysisHistoryItemDto> historyDtos = results.stream()
+                .map(result -> {
+                    AnalysisHistoryItemDto item = new AnalysisHistoryItemDto();
+                    item.setDate(formatDate(result.getCalculatedAt()));
+                    item.setTime(formatTime(result.getCalculatedAt()));
+                    item.setScore(result.getScore());
+
+                    item.setStatus(result.getScore() > 70 ? "Yüksək" : "Normal");
+                    return item;
+                })
+                .toList();
+
+        profileDto.setHistory(historyDtos);
+
+        return profileDto;
+    }
+
+    private String formatDate(Date date) {
+        if (date == null) return "Məlumat yoxdur";
+        // Формат: 15 Yanvar 2025
+        SimpleDateFormat sdf = new SimpleDateFormat("dd MMMM yyyy", new Locale("az"));
+        return sdf.format(date);
+    }
+
+    private String formatTime(Date date) {
+        if (date == null) return "00:00";
+        // Формат: 14:30
+        SimpleDateFormat sdf = new SimpleDateFormat("HH:mm");
+        return sdf.format(date);
+    }
+
     private PdfData extractAllFromPdf(StatementFile file) {
         PdfData data = new PdfData();
         try {
