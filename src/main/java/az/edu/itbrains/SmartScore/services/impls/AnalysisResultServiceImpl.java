@@ -11,7 +11,6 @@ import az.edu.itbrains.SmartScore.models.User;
 import az.edu.itbrains.SmartScore.repositories.AnalysisResultRepository;
 import az.edu.itbrains.SmartScore.repositories.StatementFileRepository;
 import az.edu.itbrains.SmartScore.repositories.TransactionRepository;
-import az.edu.itbrains.SmartScore.repositories.UserRepository;
 import az.edu.itbrains.SmartScore.services.AnalysisResultService;
 import az.edu.itbrains.SmartScore.services.GptService;
 import az.edu.itbrains.SmartScore.services.PdfService;
@@ -32,6 +31,7 @@ import java.time.ZoneId;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -65,35 +65,51 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
         if (txs == null || txs.isEmpty()) return new AnalysisResultDto();
 
         List<Transaction> sorted = txs.stream()
-                .filter(t -> t.getOperationDate() != null && t.getCategory() != null && t.getAmount() != null)
+                .filter(t -> t.getOperationDate() != null && t.getAmount() != null)
                 .sorted(Comparator.comparing(Transaction::getOperationDate))
                 .toList();
 
-        // 1. ИДЕАЛЬНЫЙ СКАНЕР PDF (Никакого ИИ!)
-        PdfData pdfData = extractAllFromPdf(lastFile);
+        if (sorted.isEmpty()) return new AnalysisResultDto();
 
-        // 2. ДЛЯ ИСТОРИИ ПЛАТЕЖЕЙ ИСПОЛЬЗУЕМ БАЗУ (Там нужны категории)
-        Map<YearMonth, MonthAgg> monthMap = buildMonthlyAggregates(sorted);
-        List<YearMonth> months;
-        BigDecimal[] monthlyIncomeForStability;
+        // 1. СЧИТАЕМ ПРИХОД И РАСХОД ИЗ ТРАНЗАКЦИЙ
+        BigDecimal totalIncome = sorted.stream()
+                .filter(t -> t.getCategory() == CategoryType.INCOME)
+                .map(Transaction::getAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        if (!pdfData.monthlyIncomes.isEmpty()) {
-            months = new ArrayList<>(pdfData.monthlyIncomes.keySet());
-            Collections.sort(months);
-            monthlyIncomeForStability = months.stream().map(pdfData.monthlyIncomes::get).toArray(BigDecimal[]::new);
-        } else {
-            // Резервный вариант, если PDF не прочитался
-            months = monthMap.keySet().stream().filter(ym -> monthMap.get(ym).income.compareTo(BigDecimal.ZERO) > 0).sorted().toList();
-            monthlyIncomeForStability = months.stream().map(m -> monthMap.get(m).income).toArray(BigDecimal[]::new);
-        }
+        BigDecimal totalExpense = sorted.stream()
+                .filter(t -> t.getCategory() != CategoryType.INCOME)
+                .map(Transaction::getAmount)
+                .map(BigDecimal::abs)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        if (months.isEmpty()) return new AnalysisResultDto();
+        // 2. ГРУППИРОВКА ПО МЕСЯЦАМ (БЕЗОПАСНАЯ)
+        Map<YearMonth, BigDecimal> monthlyMap = sorted.stream()
+                .filter(t -> t.getCategory() == CategoryType.INCOME)
+                .collect(Collectors.toMap(
+                        t -> YearMonth.from(toLocalDate(t.getOperationDate())),
+                        Transaction::getAmount,
+                        BigDecimal::add // Суммируем при дубликатах ключей
+                ));
 
-        // 3. СЧИТАЕМ СКОРИНГ (Используя идеальные цифры из PDF)
-        int incomeScore = calcIncomeStability(monthlyIncomeForStability);
-        int expenseScore = calcExpenseControl(pdfData.totalIncome, pdfData.totalExpense);
-        int balanceScore = calcBalanceDynamicsFromPdf(pdfData.openingBalance, pdfData.closingBalance);
-        int paymentScore = calcPaymentHistory(monthMap, months);
+        BigDecimal[] monthlyIncomes = monthlyMap.values().toArray(new BigDecimal[0]);
+        List<YearMonth> months = sorted.stream()
+                .map(t -> YearMonth.from(toLocalDate(t.getOperationDate())))
+                .distinct().sorted().toList();
+
+        // 3. БАЛАНС (С ПРОВЕРКОЙ НА NULL)
+        BigDecimal openingBalance = extractStartBalance(lastFile);
+        if (openingBalance.compareTo(BigDecimal.ZERO) == 0) openingBalance = BigDecimal.ONE;
+
+        BigDecimal closingBalance = openingBalance.add(totalIncome).subtract(totalExpense);
+
+        // 4. СЧИТАЕМ МЕТРИКИ
+        int incomeScore = calcIncomeStability(monthlyIncomes);
+        int expenseScore = calcExpenseControl(totalIncome, totalExpense);
+        int balanceScore = calcBalanceDynamicsFromPdf(openingBalance, closingBalance);
+
+        Map<YearMonth, MonthAgg> monthAggs = buildMonthlyAggregates(sorted);
+        int paymentScore = calcPaymentHistory(monthAggs, months);
 
         BigDecimal finalScoreRaw =
                 BigDecimal.valueOf(incomeScore).multiply(BigDecimal.valueOf(0.25))
@@ -103,13 +119,7 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
 
         int finalScore = clampInt(finalScoreRaw.setScale(0, RoundingMode.HALF_UP).intValue(), 0, 100);
 
-        System.out.println("\n================ ИТОГОВЫЙ СКОРИНГ ================");
-        System.out.println("LOG: Стабильность (" + incomeScore + " * 0.25) = " + (incomeScore * 0.25));
-        System.out.println("LOG: Расходы      (" + expenseScore + " * 0.20) = " + (expenseScore * 0.20));
-        System.out.println("LOG: Баланс       (" + balanceScore + " * 0.25) = " + (balanceScore * 0.25));
-        System.out.println("LOG: История      (" + paymentScore + " * 0.30) = " + (paymentScore * 0.30));
-        System.out.println("LOG: ФИНАЛЬНЫЙ СКОР = " + finalScore);
-        System.out.println("==================================================\n");
+        System.out.println("LOG: Final Analysis -> Score: " + finalScore + " | Months: " + months.size());
 
         AnalysisResult entity = new AnalysisResult();
         entity.setUser(user);
@@ -119,17 +129,66 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
         entity.setPaymentHistory(paymentScore);
         entity.setScore(finalScore);
         entity.setCalculatedAt(new Date());
-        entity.setPeriodMonths(months.size());
+        entity.setPeriodMonths(Math.max(1, months.size()));
         analysisResultRepository.saveAndFlush(entity);
 
-        AnalysisResultDto dto = new AnalysisResultDto();
-        dto.setIncomeStability(incomeScore);
-        dto.setExpenseControl(expenseScore);
-        dto.setBalanceDynamics(balanceScore);
-        dto.setPaymentHistory(paymentScore);
-        dto.setScore(finalScore);
-        dto.setPeriodMonths(months.size());
-        return dto;
+        return modelMapper.map(entity, AnalysisResultDto.class);
+    }
+
+    private BigDecimal extractStartBalance(StatementFile file) {
+        try {
+            String path = file.getStoredFilePath();
+            String rawText = pdfService.extractText(path);
+            if (rawText == null) return BigDecimal.ZERO;
+
+            String flatText = rawText.replace("\n", " ").replace("\r", " ").replaceAll("\\s+", " ");
+            Matcher m = Pattern.compile("(?:Giriş qalıq|əvvəlində qalıq|opening balance).*?([+-]?\\d+[\\.,]\\d{2})",
+                    Pattern.CASE_INSENSITIVE).matcher(flatText);
+
+            if (m.find()) {
+                return new BigDecimal(m.group(1).replace(',', '.'));
+            }
+        } catch (Exception ignored) {}
+        return BigDecimal.ZERO;
+    }
+
+    private int calcIncomeStability(BigDecimal[] monthlyIncome) {
+        if (monthlyIncome.length < 1) return 10;
+        if (monthlyIncome.length < 2) return 100;
+        BigDecimal total = Arrays.stream(monthlyIncome).reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal avg = total.divide(BigDecimal.valueOf(monthlyIncome.length), CALC_SCALE, RoundingMode.HALF_UP);
+        long stable = Arrays.stream(monthlyIncome).filter(m -> m.compareTo(avg.multiply(BigDecimal.valueOf(0.6))) >= 0).count();
+        return (int) ((double) stable / monthlyIncome.length * 100);
+    }
+
+    private int calcExpenseControl(BigDecimal totalIncome, BigDecimal totalExpense) {
+        if (totalIncome.compareTo(BigDecimal.ZERO) <= 0) return 10;
+        BigDecimal savingsRatio = totalIncome.subtract(totalExpense).divide(totalIncome, CALC_SCALE, RoundingMode.HALF_UP);
+        double r = savingsRatio.doubleValue();
+        if (r >= 0.25) return 100;
+        if (r >= 0.05) return 60 + (int)(r * 150);
+        return Math.max(15, 40 + (int)(r * 100));
+    }
+
+    private int calcBalanceDynamicsFromPdf(BigDecimal start, BigDecimal end) {
+        if (end.compareTo(BigDecimal.ZERO) <= 0) return 10;
+        if (start.compareTo(BigDecimal.ZERO) <= 0 || start.compareTo(BigDecimal.ONE) == 0) return 70;
+        double r = end.divide(start, CALC_SCALE, RoundingMode.HALF_UP).doubleValue();
+        if (r >= 1.1) return 100;
+        if (r >= 1.0) return 80;
+        return 40;
+    }
+
+    private int calcPaymentHistory(Map<YearMonth, MonthAgg> monthMap, List<YearMonth> months) {
+        if (months.isEmpty()) return 0;
+        long obligationMonths = months.stream()
+                .filter(m -> monthMap.get(m) != null && monthMap.get(m).hasObligation)
+                .count();
+        double a = (double) obligationMonths / months.size();
+        boolean hasCredit = months.stream()
+                .filter(m -> monthMap.get(m) != null)
+                .anyMatch(m -> monthMap.get(m).hasCredit);
+        return clampInt((int) (a * 60 + (hasCredit ? 40 : 20)), 0, 100);
     }
 
     @Override
@@ -139,8 +198,6 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
             String fileName = UUID.randomUUID() + "_" + file.getOriginalFilename();
             java.io.File uploadDir = new java.io.File("uploads");
             if (!uploadDir.exists()) uploadDir.mkdirs();
-
-            // Объявляем destination
             java.io.File destination = new java.io.File(uploadDir.getAbsolutePath() + java.io.File.separator + fileName);
             file.transferTo(destination);
 
@@ -152,18 +209,11 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
             statementFile.setStatus(az.edu.itbrains.SmartScore.enums.StatementFileStatus.COMPLETED);
             statementFile.setUser(currentUser);
             statementFile.setUploadedAt(LocalDateTime.now());
-
             statementFile = statementFileRepository.save(statementFile);
 
-            // --- ТЕПЕРЬ ВСЁ БУДЕТ ВИДНО ---
-
-            // 1. Извлекаем текст
             String rawText = pdfService.extractText(destination.getAbsolutePath());
-
-            // 2. Отправляем в ИИ (теперь gptService виден!)
             List<Transaction> transactions = gptService.analyzeStatementAndGetTransactions(rawText);
 
-            // 3. Сохраняем транзакции
             for (Transaction tx : transactions) {
                 tx.setStatementFile(statementFile);
                 tx.setUser(currentUser);
@@ -172,276 +222,63 @@ public class AnalysisResultServiceImpl implements AnalysisResultService {
             transactionRepository.flush();
 
             return calculateScore(currentUser);
-
-        } catch (Exception e) {
-            e.printStackTrace();
-            throw new RuntimeException("Xəta: " + e.getMessage());
-        }
+        } catch (Exception e) { throw new RuntimeException(e.getMessage()); }
     }
-
 
     @Override
     public AnalysisResultDto getLatestResultForUser() {
-        User currentUser = userService.getCurrentUser();
-        return analysisResultRepository.findTopByUserIdOrderByCalculatedAtDesc(currentUser.getId())
-                .map(entity -> modelMapper.map(entity, AnalysisResultDto.class))
-                .orElse(new AnalysisResultDto());
+        return analysisResultRepository.findTopByUserIdOrderByCalculatedAtDesc(userService.getCurrentUser().getId())
+                .map(entity -> modelMapper.map(entity, AnalysisResultDto.class)).orElse(new AnalysisResultDto());
     }
 
     @Override
     public UserProfileDto getUserProfileData() {
         User user = userService.getCurrentUser();
-        if (user == null) {
-            throw new RuntimeException("İstifadəçi tapılmadı");
-        }
-
         List<AnalysisResult> results = user.getAnalysisResults();
-
         UserProfileDto profileDto = new UserProfileDto();
-        profileDto.setTotalAnalyses(results.size()); // "Cəmi analiz"
-
-        if (!results.isEmpty()){
+        profileDto.setTotalAnalyses(results.size());
+        if (!results.isEmpty()) {
             AnalysisResult latest = results.get(0);
             profileDto.setLastResult(latest.getScore() + "%");
             profileDto.setLastAnalysisDate(formatDate(latest.getCalculatedAt()));
         }
-
-        List<AnalysisHistoryItemDto> historyDtos = results.stream()
-                .map(result -> {
-                    AnalysisHistoryItemDto item = new AnalysisHistoryItemDto();
-                    item.setDate(formatDate(result.getCalculatedAt()));
-                    item.setTime(formatTime(result.getCalculatedAt()));
-                    item.setScore(result.getScore());
-
-                    item.setStatus(result.getScore() > 70 ? "Yüksək" : "Normal");
-                    return item;
-                })
-                .toList();
-
-        profileDto.setHistory(historyDtos);
-
+        profileDto.setHistory(results.stream().map(result -> {
+            AnalysisHistoryItemDto item = new AnalysisHistoryItemDto();
+            item.setDate(formatDate(result.getCalculatedAt()));
+            item.setTime(formatTime(result.getCalculatedAt()));
+            item.setScore(result.getScore());
+            item.setStatus(result.getScore() >= 69 ? "Yüksək" : (result.getScore() >= 39 ? "Normal" : "Pis"));
+            return item;
+        }).toList());
         return profileDto;
-    }
-
-    private String formatDate(Date date) {
-        if (date == null) return "Məlumat yoxdur";
-        // Формат: 15 Yanvar 2025
-        SimpleDateFormat sdf = new SimpleDateFormat("dd MMMM yyyy", new Locale("az"));
-        return sdf.format(date);
-    }
-
-    private String formatTime(Date date) {
-        if (date == null) return "00:00";
-        // Формат: 14:30
-        SimpleDateFormat sdf = new SimpleDateFormat("HH:mm");
-        return sdf.format(date);
-    }
-
-    private PdfData extractAllFromPdf(StatementFile file) {
-        PdfData data = new PdfData();
-        try {
-            String filePath = "uploads/" + file.getOriginalFileName();
-            String rawText = pdfService.extractText(filePath);
-            if (rawText == null || rawText.isBlank()) return data;
-
-            String textFixed = rawText.replace("\r", " ").replace("\u00A0", " ");
-
-            // 1. ВЫТЯГИВАЕМ ШАПКУ
-            Matcher mInc = Pattern.compile("mədaxil.*?cəmi.*?(\\d+[\\.,]\\d{2})", Pattern.CASE_INSENSITIVE).matcher(textFixed);
-            if (mInc.find()) data.totalIncome = new BigDecimal(mInc.group(1).replace(',', '.'));
-
-            Matcher mExp = Pattern.compile("məxaric.*?cəmi.*?(\\d+[\\.,]\\d{2})", Pattern.CASE_INSENSITIVE).matcher(textFixed);
-            if (mExp.find()) data.totalExpense = new BigDecimal(mExp.group(1).replace(',', '.'));
-
-            Matcher mOpen = Pattern.compile("əvvəlində qalıq.*?([+-]?\\d+[\\.,]\\d{2})", Pattern.CASE_INSENSITIVE).matcher(textFixed);
-            if (mOpen.find()) data.openingBalance = new BigDecimal(mOpen.group(1).replace(',', '.'));
-
-            Matcher mClose = Pattern.compile("sonunda qalıq.*?([+-]?\\d+[\\.,]\\d{2})", Pattern.CASE_INSENSITIVE).matcher(textFixed);
-            if (mClose.find()) data.closingBalance = new BigDecimal(mClose.group(1).replace(',', '.'));
-
-            // 2. СКАНИРУЕМ СЛОВО ЗА СЛОВОМ ДЛЯ СБОРА МЕСЯЧНОГО ДОХОДА
-            String[] tokens = textFixed.split("[\\s\\n\\r\",]+");
-            YearMonth currentMonth = null;
-            Pattern dateP = Pattern.compile("^(\\d{2})-(\\d{2})-(\\d{4})$");
-            Pattern amountP = Pattern.compile("^([+-])(\\d+[\\.,]\\d{2})$");
-
-            for (String token : tokens) {
-                Matcher dMatch = dateP.matcher(token);
-                if (dMatch.matches()) {
-                    int month = Integer.parseInt(dMatch.group(2));
-                    int year = Integer.parseInt(dMatch.group(3));
-                    currentMonth = YearMonth.of(year, month);
-                    continue;
-                }
-
-                Matcher aMatch = amountP.matcher(token);
-                if (aMatch.matches() && currentMonth != null) {
-                    BigDecimal val = new BigDecimal(aMatch.group(2).replace(',', '.'));
-                    if (aMatch.group(1).equals("+")) {
-                        data.monthlyIncomes.put(currentMonth, data.monthlyIncomes.getOrDefault(currentMonth, BigDecimal.ZERO).add(val));
-                    }
-                }
-            }
-
-            System.out.println("LOG PDF DATA: Доход=" + data.totalIncome + ", Расход=" + data.totalExpense + ", Старт=" + data.openingBalance + ", Финиш=" + data.closingBalance);
-            System.out.println("LOG PDF ДОХОДЫ ПО МЕСЯЦАМ: " + data.monthlyIncomes);
-
-        } catch (Exception e) {
-            System.err.println("Cannot extract PDF data: " + e.getMessage());
-        }
-        return data;
-    }
-
-    private static class PdfData {
-        BigDecimal totalIncome = BigDecimal.ZERO;
-        BigDecimal totalExpense = BigDecimal.ZERO;
-        BigDecimal openingBalance = BigDecimal.ZERO;
-        BigDecimal closingBalance = BigDecimal.ZERO;
-        Map<YearMonth, BigDecimal> monthlyIncomes = new TreeMap<>();
-    }
-
-    // -------- METRICS --------
-
-    private int calcIncomeStability(BigDecimal[] monthlyIncome) {
-        int totalMonths = monthlyIncome.length;
-        if (totalMonths < 2) return 100;
-
-        BigDecimal max = Arrays.stream(monthlyIncome).max(Comparator.naturalOrder()).orElse(BigDecimal.ZERO);
-        BigDecimal min = Arrays.stream(monthlyIncome).min(Comparator.naturalOrder()).orElse(BigDecimal.ZERO);
-        BigDecimal totalIncome = Arrays.stream(monthlyIncome).reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        BigDecimal avg = totalIncome.divide(BigDecimal.valueOf(totalMonths), CALC_SCALE, RoundingMode.HALF_UP);
-        if (avg.compareTo(BigDecimal.ZERO) <= 0) return 0;
-
-        BigDecimal variability = max.subtract(min).divide(avg, CALC_SCALE, RoundingMode.HALF_UP);
-        BigDecimal score = BigDecimal.valueOf(100).subtract(variability.multiply(BigDecimal.valueOf(100)));
-
-        System.out.println("LOG: --- 1. СТАБИЛЬНОСТЬ ДОХОДА ---");
-        System.out.println("LOG: Месяца из PDF: " + Arrays.toString(monthlyIncome));
-        System.out.println("LOG: Балл: " + score);
-
-        return clampInt(score.setScale(0, RoundingMode.HALF_UP).intValue(), 0, 100);
-    }
-
-    private int calcExpenseControl(BigDecimal totalIncome, BigDecimal totalExpense) {
-        if (totalIncome.compareTo(BigDecimal.ZERO) <= 0) return 0;
-
-        BigDecimal ratio = totalExpense.divide(totalIncome, CALC_SCALE, RoundingMode.HALF_UP);
-        BigDecimal score = BigDecimal.valueOf(100).subtract(ratio.multiply(BigDecimal.valueOf(100)));
-        int finalScore = clampInt(score.setScale(0, RoundingMode.HALF_UP).intValue(), 0, 100);
-
-        if (finalScore <= 2) return 0; // Строгое правило
-
-        System.out.println("LOG: --- 2. РАСХОДЫ ---");
-        System.out.println("LOG: PDF Income: " + totalIncome + ", PDF Expense: " + totalExpense + " | Балл: " + finalScore);
-
-        return finalScore;
-    }
-
-    private int calcBalanceDynamicsFromPdf(BigDecimal start, BigDecimal end) {
-        // Если в конце периода на счету 0 или меньше — это 0 баллов, без вариантов.
-        if (end.compareTo(BigDecimal.ZERO) <= 0) {
-            System.out.println("LOG: --- 3. БАЛАНС -> Слит в ноль или минус. БАЛЛ=0 ---");
-            return 0;
-        }
-
-        // Если в начале был 0, а в конце появились деньги — это хороший знак (рост с нуля).
-        // Даем 70 баллов за накопление, но не 100, так как нет истории.
-        if (start.compareTo(BigDecimal.ZERO) <= 0) {
-            return 70;
-        }
-
-        // Считаем процент изменения: (Конец - Начало) / Начало
-        BigDecimal growthRate = end.subtract(start).divide(start, CALC_SCALE, RoundingMode.HALF_UP);
-
-        // Базовая оценка — 60 баллов (если баланс не изменился).
-        // Добавляем или отнимаем баллы в зависимости от роста/падения.
-        BigDecimal score = BigDecimal.valueOf(60).add(growthRate.multiply(BigDecimal.valueOf(40)));
-
-        int finalScore = clampInt(score.setScale(0, RoundingMode.HALF_UP).intValue(), 0, 100);
-
-        System.out.println("LOG: --- 3. БАЛАНС ---");
-        System.out.println("LOG: Старт: " + start + ", Конец: " + end + " | Динамика: " + finalScore);
-
-        return finalScore;
-    }
-    private int calcPaymentHistory(Map<YearMonth, MonthAgg> monthMap, List<YearMonth> months) {
-        int n = months.size();
-        if (n == 0) return 0;
-
-        long obligationMonths = months.stream().filter(m -> monthMap.get(m).hasObligation).count();
-        double a = (double) obligationMonths / n;
-
-        List<Integer> days = new ArrayList<>();
-        months.forEach(m -> {
-            if (monthMap.containsKey(m)) days.addAll(monthMap.get(m).paymentDays);
-        });
-        double avg = days.stream().mapToInt(i -> i).average().orElse(15.0);
-
-        long stableMonths = months.stream()
-                .filter(m -> monthMap.containsKey(m) && monthMap.get(m).paymentDays.stream().anyMatch(d -> Math.abs(d - avg) <= 3))
-                .count();
-        double b = (double) stableMonths / n;
-
-        boolean hasCr = months.stream().anyMatch(m -> monthMap.containsKey(m) && monthMap.get(m).hasCredit);
-
-        long distinctCore = months.stream()
-                .filter(monthMap::containsKey)
-                .flatMap(m -> monthMap.get(m).categories.stream())
-                .filter(EXPENSE_CATS::contains)
-                .distinct()
-                .count();
-        double c = hasCr ? 1.0 : Math.min(1.0, distinctCore / 3.0);
-
-        double init = (a * 40.0) + (b * 30.0) + (c * 30.0);
-        double penalty = hasCr ? 0 : 12.5;
-
-        System.out.println("LOG: --- 4. ПЛАТЕЖИ -> Балл: " + (init - penalty) + " ---");
-
-        return clampInt((int) Math.round(init - penalty), 0, 100);
     }
 
     private Map<YearMonth, MonthAgg> buildMonthlyAggregates(List<Transaction> sortedTxs) {
         Map<YearMonth, MonthAgg> map = new HashMap<>();
         for (Transaction t : sortedTxs) {
-            LocalDate d = toLocalDate(t.getOperationDate());
-            YearMonth ym = YearMonth.from(d);
-
+            YearMonth ym = YearMonth.from(toLocalDate(t.getOperationDate()));
             MonthAgg agg = map.computeIfAbsent(ym, k -> new MonthAgg());
-            BigDecimal amt = t.getAmount().abs();
-
-            if (t.getCategory() == CategoryType.INCOME || t.getCategory() == CategoryType.REGULAR_INCOME) {
-                agg.income = agg.income.add(amt);
-            } else {
-                agg.expense = agg.expense.add(amt);
-                agg.categories.add(t.getCategory());
-            }
-
+            if (t.getCategory() == CategoryType.INCOME) agg.income = agg.income.add(t.getAmount());
+            else agg.expense = agg.expense.add(t.getAmount().abs());
             if (OBLIGATION_CATS.contains(t.getCategory())) {
                 agg.hasObligation = true;
-                agg.paymentDays.add(d.getDayOfMonth());
-                if (t.getCategory() == CategoryType.CREDIT) {
-                    agg.hasCredit = true;
-                }
+                if (t.getCategory() == CategoryType.CREDIT) agg.hasCredit = true;
             }
         }
         return map;
     }
 
     private LocalDate toLocalDate(Date date) {
-        return date.toInstant().atZone(ZoneId.systemDefault()).toLocalDate();
+        return date == null ? LocalDate.now() : date.toInstant().atZone(ZoneId.systemDefault()).toLocalDate();
     }
-
-    private int clampInt(int v, int lo, int hi) {
-        return Math.max(lo, Math.min(hi, v));
-    }
+    private int clampInt(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+    private String formatDate(Date date) { return date == null ? "" : new SimpleDateFormat("dd MMMM yyyy", new Locale("az")).format(date); }
+    private String formatTime(Date date) { return date == null ? "" : new SimpleDateFormat("HH:mm").format(date); }
 
     private static class MonthAgg {
         BigDecimal income = BigDecimal.ZERO;
         BigDecimal expense = BigDecimal.ZERO;
         boolean hasObligation = false;
         boolean hasCredit = false;
-        Set<Integer> paymentDays = new HashSet<>();
-        Set<CategoryType> categories = new HashSet<>();
     }
 }

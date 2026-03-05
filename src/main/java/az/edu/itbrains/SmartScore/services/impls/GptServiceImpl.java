@@ -64,12 +64,13 @@ public class GptServiceImpl implements GptService {
         String documentYears = extractYearsFromText(extractedText);
         String dynamicPrompt = String.format(SYSTEM_PROMPT_TEMPLATE, documentYears);
 
-        List<String> chunks = splitByNewlineWithOverlap(extractedText, 2000, 400);
+        // Золотая середина: 7000 символов, перекрытие 500
+        List<String> chunks = splitByNewlineWithOverlap(extractedText, 7000, 500);
         List<TransactionDto> allRaw = new ArrayList<>();
 
         for (String part : chunks) {
             try {
-                System.out.println("LOG: Отправляю запрос в OpenAI..."); // Проверка начала
+                System.out.println("LOG: Отправляю чанк (" + part.length() + " симв.) в OpenAI...");
 
                 String raw = chatClient.prompt()
                         .system(dynamicPrompt)
@@ -77,13 +78,17 @@ public class GptServiceImpl implements GptService {
                         .call()
                         .content();
 
-                System.out.println("LOG AI RESPONSE: " + raw); // Проверка ответа
-
                 List<TransactionDto> res = safeParse(extractJsonArray(raw));
                 if (res != null) allRaw.addAll(res);
+
+                // Пауза 1.5 секунды, чтобы OpenAI не ругался на RPM
+                Thread.sleep(1500);
+
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
-                System.err.println("!!! КРИТИЧЕСКАЯ ОШИБКА ИИ !!!");
-                e.printStackTrace();
+                System.err.println("!!! ОШИБКА ЧАНКА !!!");
+                // Если чанк упал из-за квоты, мы хотя бы сохраним то, что уже успели собрать
             }
         }
 
